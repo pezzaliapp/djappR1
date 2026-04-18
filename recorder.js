@@ -1,21 +1,19 @@
 /*!
- * djappR1 Recorder v1.3 — ScriptProcessorNode per affidabilità iOS
+ * djappR1 Recorder v1.4 — ScriptProcessor lazy (iOS safe)
  * Intercetta l'AudioContext dell'app, tap sul master, registrazione via
- * ScriptProcessorNode. Nessuna dipendenza. Deve essere caricato PRIMA del
- * bundle React.
+ * ScriptProcessorNode creato LAZY al primo click REC. Nessuna dipendenza.
  *
- * Changelog v1.3 (vs v1.2):
- *   • [iOS] Sostituito AudioWorklet con ScriptProcessorNode. Su iOS Safari
- *     AudioWorklet ha noti problemi di scheduling e input routing quando il
- *     grafo audio viene creato prima che addModule() abbia finito (race
- *     condition con init asincrono dell'app). ScriptProcessor è deprecato ma
- *     funziona in modo rock-solid su iOS da anni. Per un recorder (solo
- *     capture, no output audio) il rischio glitch è trascurabile.
- *   • setupTap non è più async: nessun await, tutto sincrono dentro il
- *     constructor della PatchedCtx → il recorder è operativo IMMEDIATAMENTE.
- *
- * Changelog v1.2: iOS keep-alive gain per AudioWorklet (ora non serve più)
- * Changelog v1.1: UI REC mobile-responsive
+ * Changelog v1.4 (vs v1.3):
+ *   • [iOS] ScriptProcessorNode creato on-demand al primo click REC, non più
+ *     dentro il constructor di PatchedCtx. Motivazione: iOS Safari NON
+ *     schedula onaudioprocess per SPN creati quando l'AudioContext è
+ *     "suspended" (prima di qualunque gesto utente). Su Mac è tollerato, su
+ *     iOS no. Creandolo nel gesto-utente di REC il context è già running e
+ *     il node viene correttamente schedulato.
+ *   • Connessione spn→destination DIRETTA (niente gain a zero intermedio):
+ *     alcuni iOS non schedulano SPN connessi indirettamente.
+ *   • Output silence esplicita scritta a ogni callback: iOS vuole che il
+ *     SPN "produca" qualcosa nell'output anche se inudibile.
  *
  * (c) PezzaliApp
  */
@@ -35,7 +33,6 @@
     ctx: null,
     tap: null,
     spn: null,
-    iosKeepAlive: null,
     recording: false,
     buffers: [],
     totalSamples: 0,
@@ -56,13 +53,13 @@
   window.webkitAudioContext = PatchedCtx;
 
   function setupTap(ctx) {
-    // 1. Tap gain: riceve tutto l'audio dell'app
+    // Tap gain: riceve tutto l'audio dell'app via monkey-patch su connect()
     var tap = ctx.createGain();
     tap.gain.value = 1.0;
-    tap.connect(ctx.destination); // connessione diretta PRE-PATCH
+    tap.connect(ctx.destination); // PRE-PATCH, diretto
     state.tap = tap;
 
-    // 2. Ridirigi ogni futura connect(ctx.destination) verso tap (tranne tap stesso)
+    // Ridirigi ogni connect(ctx.destination) verso tap (tranne tap stesso)
     AudioNode.prototype.connect = function (target) {
       if (target === ctx.destination && this !== tap) {
         arguments[0] = tap;
@@ -70,46 +67,55 @@
       return TRUE_CONNECT.apply(this, arguments);
     };
 
-    // 3. ScriptProcessorNode — deprecato ma iOS-friendly.
-    //    bufferSize 4096 @ 44.1kHz = ~93ms latency, ~11 callback/sec.
-    var spn;
+    console.log('[djappR1 Recorder v1.4] Tap armato, SPN sarà creato al primo REC');
+    renderUI(); // UI subito visibile, il pulsante è già cliccabile
+  }
+
+  // -------- SPN creato LAZY al primo click REC (gesto-utente, ctx running) --------
+  function createSpnIfNeeded() {
+    if (state.spn) return true;
+    if (!state.ctx || !state.tap) return false;
+
     try {
-      spn = ctx.createScriptProcessor(4096, 2, 2);
+      var spn = state.ctx.createScriptProcessor(4096, 2, 2);
+
+      // Collega tap → SPN (per catturare) e SPN → destination DIRETTAMENTE.
+      // TRUE_CONNECT evita che la patch reindirizzi spn→destination su tap
+      // (che creerebbe loop tap→spn→tap).
+      state.tap.connect(spn);
+      TRUE_CONNECT.call(spn, state.ctx.destination);
+
+      spn.onaudioprocess = function (e) {
+        // iOS: scrivi sempre silence all'output, altrimenti alcuni iOS
+        // considerano il nodo "inattivo" e smettono di chiamarci.
+        var outL = e.outputBuffer.getChannelData(0);
+        var outR = e.outputBuffer.getChannelData(1);
+        outL.fill(0);
+        outR.fill(0);
+
+        if (!state.recording) return;
+
+        var input = e.inputBuffer;
+        var src0 = input.getChannelData(0);
+        var src1 = input.numberOfChannels > 1 ? input.getChannelData(1) : src0;
+        // getChannelData riusa il buffer sottostante → copia necessaria
+        var c0 = new Float32Array(src0.length);
+        var c1 = new Float32Array(src1.length);
+        c0.set(src0);
+        c1.set(src1);
+        state.buffers.push({ c0: c0, c1: c1 });
+        state.totalSamples += c0.length;
+        updateTime();
+      };
+
+      state.spn = spn;
+      console.log('[djappR1 Recorder v1.4] SPN creato in user-gesture, sampleRate=' +
+                  state.ctx.sampleRate + ', ctx.state=' + state.ctx.state);
+      return true;
     } catch (e) {
-      console.error('[djappR1 Recorder] createScriptProcessor fallito:', e);
-      renderUI();
-      return;
+      alert('Errore creazione recorder: ' + (e.message || e));
+      return false;
     }
-    tap.connect(spn);
-
-    // 4. iOS keep-alive: ScriptProcessor DEVE avere un percorso verso
-    //    destination per essere schedulato.
-    //    Uso TRUE_CONNECT per evitare feedback loop tap→spn→mute→tap.
-    var iosKeepAlive = ctx.createGain();
-    iosKeepAlive.gain.value = 0;
-    spn.connect(iosKeepAlive);
-    TRUE_CONNECT.call(iosKeepAlive, ctx.destination);
-    state.iosKeepAlive = iosKeepAlive;
-
-    // 5. Handler di cattura audio (main thread, ~11 volte/sec)
-    spn.onaudioprocess = function (e) {
-      if (!state.recording) return;
-      var input = e.inputBuffer;
-      var src0 = input.getChannelData(0);
-      var src1 = input.numberOfChannels > 1 ? input.getChannelData(1) : src0;
-      // Copia necessaria: getChannelData() riutilizza lo stesso buffer
-      var c0 = new Float32Array(src0.length);
-      var c1 = new Float32Array(src1.length);
-      c0.set(src0);
-      c1.set(src1);
-      state.buffers.push({ c0: c0, c1: c1 });
-      state.totalSamples += c0.length;
-      updateTime();
-    };
-
-    state.spn = spn;
-    console.log('[djappR1 Recorder v1.3] Tap armato (ScriptProcessor 4096), sampleRate=' + ctx.sampleRate);
-    renderUI();
   }
 
   // -------- WAV encoder (PCM 16-bit stereo) --------
@@ -216,12 +222,17 @@
   }
 
   function toggle() {
-    if (!state.spn) { alert('Recorder non ancora pronto. Fai partire un brano e riprova.'); return; }
+    if (!state.ctx) { alert('Recorder non pronto. Ricarica la pagina.'); return; }
     if (state.recording) stop(); else start();
   }
 
   function start() {
+    // Sblocca il context se suspended (gesto utente attivo qui)
     if (state.ctx.state === 'suspended') state.ctx.resume();
+
+    // Crea SPN LAZY — deve accadere durante gesto utente con ctx running
+    if (!createSpnIfNeeded()) return;
+
     state.buffers = [];
     state.totalSamples = 0;
     state.recording = true;
