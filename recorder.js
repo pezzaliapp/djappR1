@@ -1,19 +1,20 @@
 /*!
- * djappR1 Recorder v1.4 — ScriptProcessor lazy (iOS safe)
+ * djappR1 Recorder v1.5 — MediaRecorder + conversione a WAV
  * Intercetta l'AudioContext dell'app, tap sul master, registrazione via
- * ScriptProcessorNode creato LAZY al primo click REC. Nessuna dipendenza.
+ * MediaStreamAudioDestinationNode + MediaRecorder. Al termine, decodifica
+ * e ri-encode in WAV PCM16 stereo. Fallback al formato originale se la
+ * conversione fallisce. Nessuna dipendenza.
  *
- * Changelog v1.4 (vs v1.3):
- *   • [iOS] ScriptProcessorNode creato on-demand al primo click REC, non più
- *     dentro il constructor di PatchedCtx. Motivazione: iOS Safari NON
- *     schedula onaudioprocess per SPN creati quando l'AudioContext è
- *     "suspended" (prima di qualunque gesto utente). Su Mac è tollerato, su
- *     iOS no. Creandolo nel gesto-utente di REC il context è già running e
- *     il node viene correttamente schedulato.
- *   • Connessione spn→destination DIRETTA (niente gain a zero intermedio):
- *     alcuni iOS non schedulano SPN connessi indirettamente.
- *   • Output silence esplicita scritta a ogni callback: iOS vuole che il
- *     SPN "produca" qualcosa nell'output anche se inudibile.
+ * Changelog v1.5 (vs v1.4):
+ *   • [iOS] Via ScriptProcessorNode, dentro MediaRecorder. Su iOS Safari
+ *     onaudioprocess non si schedula mai in modo affidabile (confermato su
+ *     hardware reale), mentre MediaRecorder è l'API che Apple supporta
+ *     nativamente e funziona al primo colpo.
+ *   • Conversione AAC→WAV post-registrazione via decodeAudioData:
+ *     l'utente scarica comunque un .wav come prima.
+ *   • Fallback automatico a .m4a se decodeAudioData fallisce.
+ *   • Timer basato su Date.now() invece che samples contati (più affidabile
+ *     con MediaRecorder che emette chunk asincroni).
  *
  * (c) PezzaliApp
  */
@@ -25,17 +26,22 @@
     console.warn('[djappR1 Recorder] AudioContext non disponibile');
     return;
   }
+  if (typeof MediaRecorder === 'undefined') {
+    console.warn('[djappR1 Recorder] MediaRecorder non disponibile');
+    return;
+  }
 
-  // Salva il VERO connect PRIMA di qualunque patch
   var TRUE_CONNECT = AudioNode.prototype.connect;
 
   var state = {
     ctx: null,
     tap: null,
-    spn: null,
+    destStream: null,
+    mediaRecorder: null,
+    chunks: [],
     recording: false,
-    buffers: [],
-    totalSamples: 0,
+    startTs: 0,
+    timerInterval: null,
     ui: null
   };
 
@@ -53,13 +59,11 @@
   window.webkitAudioContext = PatchedCtx;
 
   function setupTap(ctx) {
-    // Tap gain: riceve tutto l'audio dell'app via monkey-patch su connect()
     var tap = ctx.createGain();
     tap.gain.value = 1.0;
-    tap.connect(ctx.destination); // PRE-PATCH, diretto
+    tap.connect(ctx.destination); // diretto pre-patch
     state.tap = tap;
 
-    // Ridirigi ogni connect(ctx.destination) verso tap (tranne tap stesso)
     AudioNode.prototype.connect = function (target) {
       if (target === ctx.destination && this !== tap) {
         arguments[0] = tap;
@@ -67,72 +71,87 @@
       return TRUE_CONNECT.apply(this, arguments);
     };
 
-    console.log('[djappR1 Recorder v1.4] Tap armato, SPN sarà creato al primo REC');
-    renderUI(); // UI subito visibile, il pulsante è già cliccabile
+    console.log('[djappR1 Recorder v1.5] Tap armato, MediaRecorder creato al primo REC');
+    renderUI();
   }
 
-  // -------- SPN creato LAZY al primo click REC (gesto-utente, ctx running) --------
-  function createSpnIfNeeded() {
-    if (state.spn) return true;
+  // -------- MIME type picker --------
+  function pickMimeType() {
+    var candidates = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/mp4;codecs=mp4a.40.2',
+      'audio/mp4',
+      'audio/aac'
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+      try {
+        if (MediaRecorder.isTypeSupported(candidates[i])) return candidates[i];
+      } catch (e) {}
+    }
+    return ''; // browser default
+  }
+
+  function extensionFor(mimeType) {
+    var m = (mimeType || '').toLowerCase();
+    if (m.indexOf('webm') !== -1) return 'webm';
+    if (m.indexOf('mp4') !== -1 || m.indexOf('aac') !== -1) return 'm4a';
+    if (m.indexOf('ogg') !== -1) return 'ogg';
+    return 'audio';
+  }
+
+  // -------- Setup MediaRecorder LAZY al primo REC (gesto-utente) --------
+  function createRecorderIfNeeded() {
+    if (state.mediaRecorder) return true;
     if (!state.ctx || !state.tap) return false;
 
     try {
-      var spn = state.ctx.createScriptProcessor(4096, 2, 2);
+      // MediaStreamAudioDestinationNode è un endpoint: tap → destStream.stream
+      var dest = state.ctx.createMediaStreamDestination();
+      state.tap.connect(dest);
+      state.destStream = dest;
 
-      // Collega tap → SPN (per catturare) e SPN → destination DIRETTAMENTE.
-      // TRUE_CONNECT evita che la patch reindirizzi spn→destination su tap
-      // (che creerebbe loop tap→spn→tap).
-      state.tap.connect(spn);
-      TRUE_CONNECT.call(spn, state.ctx.destination);
+      var mime = pickMimeType();
+      var opts = mime ? { mimeType: mime } : undefined;
+      var rec = new MediaRecorder(dest.stream, opts);
 
-      spn.onaudioprocess = function (e) {
-        // iOS: scrivi sempre silence all'output, altrimenti alcuni iOS
-        // considerano il nodo "inattivo" e smettono di chiamarci.
-        var outL = e.outputBuffer.getChannelData(0);
-        var outR = e.outputBuffer.getChannelData(1);
-        outL.fill(0);
-        outR.fill(0);
-
-        if (!state.recording) return;
-
-        var input = e.inputBuffer;
-        var src0 = input.getChannelData(0);
-        var src1 = input.numberOfChannels > 1 ? input.getChannelData(1) : src0;
-        // getChannelData riusa il buffer sottostante → copia necessaria
-        var c0 = new Float32Array(src0.length);
-        var c1 = new Float32Array(src1.length);
-        c0.set(src0);
-        c1.set(src1);
-        state.buffers.push({ c0: c0, c1: c1 });
-        state.totalSamples += c0.length;
-        updateTime();
+      rec.ondataavailable = function (e) {
+        if (e.data && e.data.size > 0) state.chunks.push(e.data);
+      };
+      rec.onstop = function () { finalize(); };
+      rec.onerror = function (e) {
+        console.error('[djappR1 Recorder] MediaRecorder error:', e);
+        alert('Errore durante la registrazione: ' + (e.error && e.error.message ? e.error.message : 'ignoto'));
       };
 
-      state.spn = spn;
-      console.log('[djappR1 Recorder v1.4] SPN creato in user-gesture, sampleRate=' +
-                  state.ctx.sampleRate + ', ctx.state=' + state.ctx.state);
+      state.mediaRecorder = rec;
+      console.log('[djappR1 Recorder v1.5] MediaRecorder creato, mimeType=' +
+                  (rec.mimeType || '(default)') + ', ctx.state=' + state.ctx.state);
       return true;
     } catch (e) {
-      alert('Errore creazione recorder: ' + (e.message || e));
+      alert('Errore creazione MediaRecorder: ' + (e.message || e));
       return false;
     }
   }
 
-  // -------- WAV encoder (PCM 16-bit stereo) --------
-  function encodeWAV(buffers, sampleRate) {
-    var total = 0;
-    for (var i = 0; i < buffers.length; i++) total += buffers[i].c0.length;
+  // -------- Encoders --------
+  // Da AudioBuffer → WAV PCM16 stereo
+  function encodeWAVFromAudioBuffer(audioBuffer) {
+    var numCh = Math.min(audioBuffer.numberOfChannels, 2);
+    var sampleRate = audioBuffer.sampleRate;
+    var total = audioBuffer.length;
+    var c0 = audioBuffer.getChannelData(0);
+    var c1 = numCh > 1 ? audioBuffer.getChannelData(1) : c0;
+
     var pcm = new Int16Array(total * 2);
     var off = 0;
-    for (var j = 0; j < buffers.length; j++) {
-      var c0 = buffers[j].c0, c1 = buffers[j].c1;
-      for (var k = 0; k < c0.length; k++) {
-        var s0 = c0[k] < -1 ? -1 : c0[k] > 1 ? 1 : c0[k];
-        var s1 = c1[k] < -1 ? -1 : c1[k] > 1 ? 1 : c1[k];
-        pcm[off++] = s0 < 0 ? s0 * 0x8000 : s0 * 0x7FFF;
-        pcm[off++] = s1 < 0 ? s1 * 0x8000 : s1 * 0x7FFF;
-      }
+    for (var k = 0; k < total; k++) {
+      var s0 = c0[k] < -1 ? -1 : c0[k] > 1 ? 1 : c0[k];
+      var s1 = c1[k] < -1 ? -1 : c1[k] > 1 ? 1 : c1[k];
+      pcm[off++] = s0 < 0 ? s0 * 0x8000 : s0 * 0x7FFF;
+      pcm[off++] = s1 < 0 ? s1 * 0x8000 : s1 * 0x7FFF;
     }
+
     var dataSize = pcm.byteLength;
     var buf = new ArrayBuffer(44 + dataSize);
     var dv = new DataView(buf);
@@ -152,6 +171,67 @@
     dv.setUint32(40, dataSize, true);
     new Int16Array(buf, 44).set(pcm);
     return new Blob([buf], { type: 'audio/wav' });
+  }
+
+  function downloadBlob(blob, filename) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+  }
+
+  // Finalize: combina chunks, decodifica, ri-encoda in WAV, scarica
+  function finalize() {
+    var wasOn = state.chunks.length > 0;
+    state.ui.btn.disabled = true;
+    state.ui.btn.textContent = '...';
+
+    if (!wasOn) {
+      state.ui.btn.disabled = false;
+      state.ui.btn.textContent = '● REC';
+      state.ui.time.textContent = '00:00';
+      alert('Nessun audio catturato.');
+      return;
+    }
+
+    var mime = (state.mediaRecorder && state.mediaRecorder.mimeType) || 'audio/mp4';
+    var blob = new Blob(state.chunks, { type: mime });
+    state.chunks = [];
+    var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+
+    // Prova a convertire a WAV
+    blob.arrayBuffer()
+      .then(function (ab) {
+        // decodeAudioData richiede un AudioContext; usiamo quello esistente.
+        return new Promise(function (resolve, reject) {
+          state.ctx.decodeAudioData(
+            ab.slice(0), // slice per sicurezza: alcune implementazioni consumano l'AB
+            function (audioBuf) { resolve(audioBuf); },
+            function (err) { reject(err || new Error('decodeAudioData failed')); }
+          );
+        });
+      })
+      .then(function (audioBuf) {
+        var wav = encodeWAVFromAudioBuffer(audioBuf);
+        downloadBlob(wav, 'djappR1-mix-' + ts + '.wav');
+        console.log('[djappR1 Recorder v1.5] WAV scaricato, durata=' +
+                    audioBuf.duration.toFixed(2) + 's');
+      })
+      .catch(function (err) {
+        // Fallback: scarica nel formato originale
+        console.warn('[djappR1 Recorder v1.5] conversione WAV fallita, fallback:', err);
+        var ext = extensionFor(mime);
+        downloadBlob(blob, 'djappR1-mix-' + ts + '.' + ext);
+      })
+      .finally(function () {
+        state.ui.btn.disabled = false;
+        state.ui.btn.textContent = '● REC';
+        state.ui.time.textContent = '00:00';
+      });
   }
 
   // -------- UI overlay (mobile-responsive) --------
@@ -180,6 +260,7 @@
         'touch-action:manipulation;-webkit-tap-highlight-color:transparent;',
       '}',
       '#djapp-rec-ui button.on{background:#ff3344;color:#fff}',
+      '#djapp-rec-ui button:disabled{opacity:.6}',
       '#djapp-rec-dot{width:8px;height:8px;border-radius:50%;background:#666;flex:0 0 auto}',
       '#djapp-rec-ui.on #djapp-rec-dot{background:#ff3344;animation:djapp-blink 1s infinite}',
       '@keyframes djapp-blink{50%{opacity:.3}}',
@@ -227,48 +308,59 @@
   }
 
   function start() {
-    // Sblocca il context se suspended (gesto utente attivo qui)
     if (state.ctx.state === 'suspended') state.ctx.resume();
+    if (!createRecorderIfNeeded()) return;
 
-    // Crea SPN LAZY — deve accadere durante gesto utente con ctx running
-    if (!createSpnIfNeeded()) return;
-
-    state.buffers = [];
-    state.totalSamples = 0;
+    state.chunks = [];
     state.recording = true;
+    state.startTs = Date.now();
+
+    try {
+      state.mediaRecorder.start(1000); // emette un chunk ogni secondo
+    } catch (e) {
+      alert('Impossibile avviare MediaRecorder: ' + (e.message || e));
+      state.recording = false;
+      return;
+    }
+
     state.ui.wrap.classList.add('on');
     state.ui.btn.classList.add('on');
     state.ui.btn.textContent = '■ STOP';
+
+    // Timer wall-clock (più affidabile dei chunk MediaRecorder)
+    if (state.timerInterval) clearInterval(state.timerInterval);
+    state.timerInterval = setInterval(function () {
+      if (!state.recording) return;
+      var sec = Math.floor((Date.now() - state.startTs) / 1000);
+      var m = String(Math.floor(sec / 60)).padStart(2, '0');
+      var s = String(sec % 60).padStart(2, '0');
+      state.ui.time.textContent = m + ':' + s;
+    }, 250);
   }
 
   function stop() {
+    if (!state.recording) return;
     state.recording = false;
+
+    if (state.timerInterval) {
+      clearInterval(state.timerInterval);
+      state.timerInterval = null;
+    }
+
     state.ui.wrap.classList.remove('on');
     state.ui.btn.classList.remove('on');
-    state.ui.btn.textContent = '● REC';
+    // finalize() aggiorna testo e disabled
 
-    if (state.buffers.length === 0) { alert('Nessun audio catturato.'); return; }
-
-    var blob = encodeWAV(state.buffers, state.ctx.sampleRate);
-    var url = URL.createObjectURL(blob);
-    var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = 'djappR1-mix-' + ts + '.wav';
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
-
-    state.buffers = [];
-    state.totalSamples = 0;
-    state.ui.time.textContent = '00:00';
-  }
-
-  function updateTime() {
-    if (!state.ui || !state.recording) return;
-    var sec = Math.floor(state.totalSamples / state.ctx.sampleRate);
-    var m = String(Math.floor(sec / 60)).padStart(2, '0');
-    var s = String(sec % 60).padStart(2, '0');
-    state.ui.time.textContent = m + ':' + s;
+    try {
+      if (state.mediaRecorder && state.mediaRecorder.state !== 'inactive') {
+        state.mediaRecorder.stop(); // triggera onstop → finalize()
+      } else {
+        finalize();
+      }
+    } catch (e) {
+      console.error('[djappR1 Recorder v1.5] stop error:', e);
+      finalize();
+    }
   }
 
   if (document.readyState === 'loading') {
