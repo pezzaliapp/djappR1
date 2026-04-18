@@ -1,0 +1,25 @@
+{
+  "name": "djappR1 by PezzaliApp",
+  "short_name": "djappR1",
+  "description": "DJ app — fork R1 con beatmatch buffer-based iOS-compatible e REC responsive",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#080808",
+  "theme_color": "#080808",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
