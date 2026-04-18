@@ -8,7 +8,7 @@
  * - Audio / blob / range requests: SEMPRE bypass (Safari iOS fix)
  */
 
-const APP_VERSION = 'djappr1-v1.0.1'
+const APP_VERSION = 'djappr1-v1.0.2'
 const CACHE_NAME = APP_VERSION
 
 const PRECACHE_URLS = [

@@ -1,19 +1,21 @@
 /*!
- * djappR1 Recorder v1.2 — WAV PCM16 stereo, iOS-compatible
- * Intercetta l'AudioContext dell'app, tap sul master, registrazione via AudioWorklet.
- * Nessuna dipendenza. Deve essere caricato PRIMA del bundle React.
+ * djappR1 Recorder v1.3 — ScriptProcessorNode per affidabilità iOS
+ * Intercetta l'AudioContext dell'app, tap sul master, registrazione via
+ * ScriptProcessorNode. Nessuna dipendenza. Deve essere caricato PRIMA del
+ * bundle React.
  *
- * Changelog v1.2 (vs v1.1):
- *   • [iOS] FIX CRITICO: il worklet è ora connesso a ctx.destination tramite
- *     un GainNode a volume 0. iOS Safari schedula process() di un
- *     AudioWorkletNode SOLO se il nodo ha un percorso verso destination.
- *     Prima su iPhone la registrazione restava a 00:00 e "Nessun audio catturato".
- *   • Uso origConnect salvato in anticipo per bypassare il monkey-patch
- *     sul percorso keep-alive → destination (altrimenti feedback loop).
+ * Changelog v1.3 (vs v1.2):
+ *   • [iOS] Sostituito AudioWorklet con ScriptProcessorNode. Su iOS Safari
+ *     AudioWorklet ha noti problemi di scheduling e input routing quando il
+ *     grafo audio viene creato prima che addModule() abbia finito (race
+ *     condition con init asincrono dell'app). ScriptProcessor è deprecato ma
+ *     funziona in modo rock-solid su iOS da anni. Per un recorder (solo
+ *     capture, no output audio) il rischio glitch è trascurabile.
+ *   • setupTap non è più async: nessun await, tutto sincrono dentro il
+ *     constructor della PatchedCtx → il recorder è operativo IMMEDIATAMENTE.
  *
- * Changelog v1.1:
- *   • UI REC responsive: su mobile (<=600px) sale sopra la mobile nav (60px
- *     + safe-area). Touch target >= 36 px. Rispetta env(safe-area-inset-*).
+ * Changelog v1.2: iOS keep-alive gain per AudioWorklet (ora non serve più)
+ * Changelog v1.1: UI REC mobile-responsive
  *
  * (c) PezzaliApp
  */
@@ -26,14 +28,13 @@
     return;
   }
 
-  // Salva il VERO connect originale PRIMA di qualunque patch, così può essere
-  // usato per bypassare il monkey-patch sul percorso keep-alive iOS.
+  // Salva il VERO connect PRIMA di qualunque patch
   var TRUE_CONNECT = AudioNode.prototype.connect;
 
   var state = {
     ctx: null,
     tap: null,
-    worklet: null,
+    spn: null,
     iosKeepAlive: null,
     recording: false,
     buffers: [],
@@ -41,50 +42,27 @@
     ui: null
   };
 
-  // -------- Worklet processor (inline via Blob URL) --------
-  var workletSrc = [
-    'class DjAppRec extends AudioWorkletProcessor {',
-    '  constructor(){ super(); this.on=false;',
-    '    this.port.onmessage = (e) => {',
-    '      if (e.data.cmd === "start") this.on = true;',
-    '      else if (e.data.cmd === "stop") this.on = false;',
-    '    };',
-    '  }',
-    '  process(inputs){',
-    '    const inp = inputs[0];',
-    '    if (this.on && inp && inp.length > 0) {',
-    '      const c0 = inp[0] ? new Float32Array(inp[0]) : new Float32Array(128);',
-    '      const c1 = inp[1] ? new Float32Array(inp[1]) : new Float32Array(c0);',
-    '      this.port.postMessage({c0, c1}, [c0.buffer, c1.buffer]);',
-    '    }',
-    '    return true;',
-    '  }',
-    '}',
-    'registerProcessor("djapp-rec", DjAppRec);'
-  ].join('\n');
-  var workletUrl = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
-
   // -------- Monkey-patch AudioContext --------
   class PatchedCtx extends OrigCtx {
     constructor() {
       super(...arguments);
       if (!state.ctx) {
         state.ctx = this;
-        setupTap(this).catch(function (e) { console.error('[djappR1 Recorder] setup:', e); });
+        try { setupTap(this); } catch (e) { console.error('[djappR1 Recorder] setup:', e); }
       }
     }
   }
   window.AudioContext = PatchedCtx;
   window.webkitAudioContext = PatchedCtx;
 
-  async function setupTap(ctx) {
-    // 1. Tap gain in parallelo: riceve tutto l'audio dell'app
+  function setupTap(ctx) {
+    // 1. Tap gain: riceve tutto l'audio dell'app
     var tap = ctx.createGain();
     tap.gain.value = 1.0;
-    tap.connect(ctx.destination); // diretto (pre-patch)
+    tap.connect(ctx.destination); // connessione diretta PRE-PATCH
     state.tap = tap;
 
-    // 2. Ridirigi ogni connect(ctx.destination) futuro verso tap (tranne tap stesso)
+    // 2. Ridirigi ogni futura connect(ctx.destination) verso tap (tranne tap stesso)
     AudioNode.prototype.connect = function (target) {
       if (target === ctx.destination && this !== tap) {
         arguments[0] = tap;
@@ -92,36 +70,45 @@
       return TRUE_CONNECT.apply(this, arguments);
     };
 
-    // 3. AudioWorklet
-    await ctx.audioWorklet.addModule(workletUrl);
-    var worklet = new AudioWorkletNode(ctx, 'djapp-rec', {
-      numberOfInputs: 1,
-      numberOfOutputs: 1,
-      outputChannelCount: [2]
-    });
-    tap.connect(worklet); // audio dell'app → worklet.input
+    // 3. ScriptProcessorNode — deprecato ma iOS-friendly.
+    //    bufferSize 4096 @ 44.1kHz = ~93ms latency, ~11 callback/sec.
+    var spn;
+    try {
+      spn = ctx.createScriptProcessor(4096, 2, 2);
+    } catch (e) {
+      console.error('[djappR1 Recorder] createScriptProcessor fallito:', e);
+      renderUI();
+      return;
+    }
+    tap.connect(spn);
 
-    // 4. iOS FIX — worklet deve avere un percorso verso destination altrimenti
-    //    Safari iOS NON chiama process(). Uso TRUE_CONNECT per evitare che la
-    //    patch reindirizzi keepAlive→destination su tap (creerebbe loop
-    //    tap→worklet→keepAlive→tap).
+    // 4. iOS keep-alive: ScriptProcessor DEVE avere un percorso verso
+    //    destination per essere schedulato.
+    //    Uso TRUE_CONNECT per evitare feedback loop tap→spn→mute→tap.
     var iosKeepAlive = ctx.createGain();
-    iosKeepAlive.gain.value = 0;           // silenzioso, inudibile
-    worklet.connect(iosKeepAlive);
+    iosKeepAlive.gain.value = 0;
+    spn.connect(iosKeepAlive);
     TRUE_CONNECT.call(iosKeepAlive, ctx.destination);
     state.iosKeepAlive = iosKeepAlive;
 
-    // 5. Messaggi dal worklet
-    worklet.port.onmessage = function (e) {
+    // 5. Handler di cattura audio (main thread, ~11 volte/sec)
+    spn.onaudioprocess = function (e) {
       if (!state.recording) return;
-      state.buffers.push(e.data);
-      state.totalSamples += e.data.c0.length;
+      var input = e.inputBuffer;
+      var src0 = input.getChannelData(0);
+      var src1 = input.numberOfChannels > 1 ? input.getChannelData(1) : src0;
+      // Copia necessaria: getChannelData() riutilizza lo stesso buffer
+      var c0 = new Float32Array(src0.length);
+      var c1 = new Float32Array(src1.length);
+      c0.set(src0);
+      c1.set(src1);
+      state.buffers.push({ c0: c0, c1: c1 });
+      state.totalSamples += c0.length;
       updateTime();
     };
-    state.worklet = worklet;
 
-    console.log('[djappR1 Recorder v1.2] Tap armato, sampleRate=' + ctx.sampleRate +
-                ', iOS keep-alive attivo');
+    state.spn = spn;
+    console.log('[djappR1 Recorder v1.3] Tap armato (ScriptProcessor 4096), sampleRate=' + ctx.sampleRate);
     renderUI();
   }
 
@@ -229,18 +216,15 @@
   }
 
   function toggle() {
-    if (!state.worklet) { alert('Recorder non ancora pronto. Fai partire un brano e riprova.'); return; }
+    if (!state.spn) { alert('Recorder non ancora pronto. Fai partire un brano e riprova.'); return; }
     if (state.recording) stop(); else start();
   }
 
   function start() {
-    if (state.ctx.state === 'suspended') {
-      state.ctx.resume(); // iOS: sblocca ctx sul gesto utente
-    }
+    if (state.ctx.state === 'suspended') state.ctx.resume();
     state.buffers = [];
     state.totalSamples = 0;
     state.recording = true;
-    state.worklet.port.postMessage({ cmd: 'start' });
     state.ui.wrap.classList.add('on');
     state.ui.btn.classList.add('on');
     state.ui.btn.textContent = '■ STOP';
@@ -248,7 +232,6 @@
 
   function stop() {
     state.recording = false;
-    state.worklet.port.postMessage({ cmd: 'stop' });
     state.ui.wrap.classList.remove('on');
     state.ui.btn.classList.remove('on');
     state.ui.btn.textContent = '● REC';
