@@ -1,14 +1,19 @@
 /*!
- * djappR1 Recorder v1.1 — WAV PCM16 stereo, mobile-friendly UI
+ * djappR1 Recorder v1.2 — WAV PCM16 stereo, iOS-compatible
  * Intercetta l'AudioContext dell'app, tap sul master, registrazione via AudioWorklet.
  * Nessuna dipendenza. Deve essere caricato PRIMA del bundle React.
  *
- * Rispetto alla v1.0:
- *   • Pulsante REC posizionato via CSS responsive: su mobile (<=600px) viene
- *     alzato sopra la mobile nav (52px + safe-area), così non si sovrappone
- *     più ai tab DECK B / LIBRARY.
- *   • Dimensioni pulsante scalate sul mobile per touch target >= 44px.
- *   • Rispetta env(safe-area-inset-*) per iPhone con notch/Dynamic Island.
+ * Changelog v1.2 (vs v1.1):
+ *   • [iOS] FIX CRITICO: il worklet è ora connesso a ctx.destination tramite
+ *     un GainNode a volume 0. iOS Safari schedula process() di un
+ *     AudioWorkletNode SOLO se il nodo ha un percorso verso destination.
+ *     Prima su iPhone la registrazione restava a 00:00 e "Nessun audio catturato".
+ *   • Uso origConnect salvato in anticipo per bypassare il monkey-patch
+ *     sul percorso keep-alive → destination (altrimenti feedback loop).
+ *
+ * Changelog v1.1:
+ *   • UI REC responsive: su mobile (<=600px) sale sopra la mobile nav (60px
+ *     + safe-area). Touch target >= 36 px. Rispetta env(safe-area-inset-*).
  *
  * (c) PezzaliApp
  */
@@ -21,10 +26,15 @@
     return;
   }
 
+  // Salva il VERO connect originale PRIMA di qualunque patch, così può essere
+  // usato per bypassare il monkey-patch sul percorso keep-alive iOS.
+  var TRUE_CONNECT = AudioNode.prototype.connect;
+
   var state = {
     ctx: null,
     tap: null,
     worklet: null,
+    iosKeepAlive: null,
     recording: false,
     buffers: [],
     totalSamples: 0,
@@ -68,26 +78,40 @@
   window.webkitAudioContext = PatchedCtx;
 
   async function setupTap(ctx) {
+    // 1. Tap gain in parallelo: riceve tutto l'audio dell'app
     var tap = ctx.createGain();
     tap.gain.value = 1.0;
-    tap.connect(ctx.destination);
+    tap.connect(ctx.destination); // diretto (pre-patch)
     state.tap = tap;
 
-    var origConnect = AudioNode.prototype.connect;
+    // 2. Ridirigi ogni connect(ctx.destination) futuro verso tap (tranne tap stesso)
     AudioNode.prototype.connect = function (target) {
       if (target === ctx.destination && this !== tap) {
         arguments[0] = tap;
       }
-      return origConnect.apply(this, arguments);
+      return TRUE_CONNECT.apply(this, arguments);
     };
 
+    // 3. AudioWorklet
     await ctx.audioWorklet.addModule(workletUrl);
     var worklet = new AudioWorkletNode(ctx, 'djapp-rec', {
       numberOfInputs: 1,
       numberOfOutputs: 1,
       outputChannelCount: [2]
     });
-    tap.connect(worklet);
+    tap.connect(worklet); // audio dell'app → worklet.input
+
+    // 4. iOS FIX — worklet deve avere un percorso verso destination altrimenti
+    //    Safari iOS NON chiama process(). Uso TRUE_CONNECT per evitare che la
+    //    patch reindirizzi keepAlive→destination su tap (creerebbe loop
+    //    tap→worklet→keepAlive→tap).
+    var iosKeepAlive = ctx.createGain();
+    iosKeepAlive.gain.value = 0;           // silenzioso, inudibile
+    worklet.connect(iosKeepAlive);
+    TRUE_CONNECT.call(iosKeepAlive, ctx.destination);
+    state.iosKeepAlive = iosKeepAlive;
+
+    // 5. Messaggi dal worklet
     worklet.port.onmessage = function (e) {
       if (!state.recording) return;
       state.buffers.push(e.data);
@@ -95,7 +119,9 @@
       updateTime();
     };
     state.worklet = worklet;
-    console.log('[djappR1 Recorder] Tap armato, sampleRate=' + ctx.sampleRate);
+
+    console.log('[djappR1 Recorder v1.2] Tap armato, sampleRate=' + ctx.sampleRate +
+                ', iOS keep-alive attivo');
     renderUI();
   }
 
@@ -142,7 +168,6 @@
 
     var style = document.createElement('style');
     style.textContent = [
-      /* Default: desktop, pulsante in basso a destra */
       '#djapp-rec-ui{',
         'position:fixed;',
         'right:calc(16px + env(safe-area-inset-right));',
@@ -166,7 +191,6 @@
       '#djapp-rec-ui.on #djapp-rec-dot{background:#ff3344;animation:djapp-blink 1s infinite}',
       '@keyframes djapp-blink{50%{opacity:.3}}',
       '#djapp-rec-time{font-variant-numeric:tabular-nums;min-width:44px;text-align:right}',
-      /* Mobile (<=600px): sopra la mobile nav (52px in app + safe-area), pulsante più grande */
       '@media (max-width: 600px){',
         '#djapp-rec-ui{',
           'bottom:calc(60px + env(safe-area-inset-bottom));',
@@ -183,7 +207,6 @@
         '#djapp-rec-dot{width:10px;height:10px}',
         '#djapp-rec-time{min-width:40px;font-size:11px}',
       '}',
-      /* Very narrow (<=360px): nasconde il tempo per lasciare solo dot+REC */
       '@media (max-width: 360px){',
         '#djapp-rec-time{display:none}',
       '}'
@@ -211,7 +234,9 @@
   }
 
   function start() {
-    if (state.ctx.state === 'suspended') state.ctx.resume();
+    if (state.ctx.state === 'suspended') {
+      state.ctx.resume(); // iOS: sblocca ctx sul gesto utente
+    }
     state.buffers = [];
     state.totalSamples = 0;
     state.recording = true;
